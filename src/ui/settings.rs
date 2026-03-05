@@ -2,6 +2,7 @@
 //!
 //! Opens a native window where the user can edit all TypePaste configuration
 //! values. Changes are saved to disk and hot-reloaded into the running engine.
+//! Hotkey changes are applied immediately (no restart required).
 
 use std::sync::{Arc, Mutex};
 
@@ -26,6 +27,7 @@ struct SettingsApp {
     buf_initial_delay: String,
     buf_max_text_length: String,
     buf_hotkey: String,
+    buf_paste_hotkey: String,
 }
 
 impl SettingsApp {
@@ -37,6 +39,7 @@ impl SettingsApp {
         let buf_initial_delay = config.initial_delay_ms.to_string();
         let buf_max_text_length = config.max_text_length.to_string();
         let buf_hotkey = config.hotkey.clone();
+        let buf_paste_hotkey = config.paste_hotkey.clone();
         Self {
             config,
             engine,
@@ -47,6 +50,7 @@ impl SettingsApp {
             buf_initial_delay,
             buf_max_text_length,
             buf_hotkey,
+            buf_paste_hotkey,
         }
     }
 
@@ -68,6 +72,7 @@ impl SettingsApp {
             self.config.max_text_length = v;
         }
         self.config.hotkey = self.buf_hotkey.trim().to_string();
+        self.config.paste_hotkey = self.buf_paste_hotkey.trim().to_string();
         self.config.validate();
     }
 
@@ -79,6 +84,7 @@ impl SettingsApp {
         self.buf_initial_delay = self.config.initial_delay_ms.to_string();
         self.buf_max_text_length = self.config.max_text_length.to_string();
         self.buf_hotkey = self.config.hotkey.clone();
+        self.buf_paste_hotkey = self.config.paste_hotkey.clone();
     }
 
     /// Save config to disk and update the running engine.
@@ -87,14 +93,15 @@ impl SettingsApp {
         match self.config.save() {
             Ok(()) => {
                 // Hot-reload into the running engine
+                // (the tray event loop detects config changes and re-registers hotkeys)
                 if let Ok(mut engine) = self.engine.lock() {
                     engine.update_config(self.config.clone());
                 }
-                self.status = "Saved and applied.".to_string();
+                self.status = "✓ Saved and applied.".to_string();
                 info!("Settings saved and applied");
             }
             Err(e) => {
-                self.status = format!("Save failed: {e}");
+                self.status = format!("✗ Save failed: {e}");
                 error!("Failed to save settings: {e}");
             }
         }
@@ -189,24 +196,49 @@ impl eframe::App for SettingsApp {
 
             ui.add_space(8.0);
 
-            // ── Hotkey ──
+            // ── Hotkeys ──
             ui.group(|ui| {
-                ui.strong("Hotkey");
+                ui.strong("Hotkeys");
                 ui.add_space(4.0);
-                ui.label("Restart required for hotkey changes to take effect.");
+                ui.label("Format: Modifier+Modifier+Key  (e.g. Cmd+Shift+V, Ctrl+Alt+P)");
+                ui.label(
+                    egui::RichText::new("Changes are applied immediately after Save.")
+                        .small()
+                        .weak(),
+                );
                 ui.add_space(4.0);
 
                 egui::Grid::new("hotkey_grid")
                     .num_columns(2)
                     .spacing([12.0, 6.0])
                     .show(ui, |ui| {
-                        ui.label("Global hotkey:");
+                        ui.label("Primary hotkey:");
                         ui.add(
                             egui::TextEdit::singleline(&mut self.buf_hotkey)
-                                .desired_width(160.0),
+                                .desired_width(160.0)
+                                .hint_text("Cmd+Shift+V"),
+                        );
+                        ui.end_row();
+
+                        ui.label("Additional hotkey:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.buf_paste_hotkey)
+                                .desired_width(160.0)
+                                .hint_text("(optional)"),
                         );
                         ui.end_row();
                     });
+
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Supported modifiers: Cmd/Ctrl/Shift/Alt/Option\n\
+                         Supported keys: A-Z, 0-9, F1-F12, Space, Enter, Tab, Esc, \
+                         Home, End, PageUp, PageDown, Up/Down/Left/Right, Delete, Backspace",
+                    )
+                    .small()
+                    .weak(),
+                );
             });
 
             ui.add_space(8.0);
@@ -282,8 +314,8 @@ pub fn open_settings_window(engine: Arc<Mutex<TypeEngine>>) {
         let options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
                 .with_title("TypePaste Settings")
-                .with_inner_size([420.0, 560.0])
-                .with_min_inner_size([360.0, 400.0])
+                .with_inner_size([440.0, 640.0])
+                .with_min_inner_size([380.0, 500.0])
                 .with_resizable(true),
             ..Default::default()
         };

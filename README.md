@@ -1,6 +1,6 @@
 # TypePaste
 
-**Paste clipboard text anywhere via keystroke emulation** — even into remote desktops, VMs, and applications that don't support direct paste.
+**Paste text anywhere via keystroke emulation** — even into remote desktops, VMs, and applications that don't support direct paste.
 
 ## Problem
 
@@ -8,13 +8,16 @@ Many remote desktop tools (RDP, VNC, vSphere console, ILO, IPMI), virtual machin
 
 ## Solution
 
-TypePaste reads text from your clipboard and "types" it out character by character by emitting real OS-level keystroke events. The target application sees these as genuine keyboard input, bypassing any clipboard restrictions.
+TypePaste reads text from your clipboard (or CLI argument / stdin) and "types" it out character by character by emitting real OS-level keystroke events. The target application sees these as genuine keyboard input, bypassing any clipboard restrictions.
 
 ## Features
 
 - **Cross-platform** — macOS (first) + Windows
-- **Global hotkey** — `Cmd+Shift+V` (macOS) / `Ctrl+Shift+V` (Windows)
+- **Two modes** — system tray GUI + headless CLI
+- **Customizable hotkeys** — primary + optional additional, editable in GUI, applied instantly
 - **System tray** — minimal UI, always accessible
+- **CLI mode** — scriptable, pipe-friendly, MCP-server-ready
+- **Window targeting** — focus a window by title substring or PID before typing
 - **Unicode support** — handles special characters, not just ASCII
 - **Configurable delays** — fixed base delay + optional random jitter
 - **Human-like typing** — random delay range simulates natural input cadence
@@ -24,96 +27,52 @@ TypePaste reads text from your clipboard and "types" it out character by charact
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                         TypePaste App                            │
-│                                                                  │
-│  ┌─────────────┐  ┌──────────────┐  ┌─────────────────────────┐ │
-│  │ System Tray │  │ Global       │  │    TypeEngine           │ │
-│  │ (tray-icon) │◄─│ Hotkey       │─►│                         │ │
-│  │             │  │ (global-     │  │ 1. Read clipboard       │ │
-│  │ • Paste     │  │  hotkey)     │  │    (arboard)            │ │
-│  │ • Settings  │  │              │  │ 2. Initial delay        │ │
-│  │ • Quit      │  │ Cmd+Shift+V │  │    (configurable)       │ │
-│  └─────────────┘  │ Ctrl+Shift+V│  │ 3. Emit keystrokes      │ │
-│                   └──────────────┘  │    per character         │ │
-│                                     │ 4. base + random delay  │ │
-│                                     └──────────┬──────────────┘ │
-│                                                │                │
-│  ┌─────────────────────────────────────────────▼──────────────┐ │
-│  │                    Platform Layer                           │ │
-│  │                                                             │ │
-│  │  ┌─────────────────────┐  ┌───────────────────────────┐    │ │
-│  │  │       macOS         │  │        Windows             │    │ │
-│  │  │                     │  │                            │    │ │
-│  │  │ • CGEvent API       │  │ • SendInput API            │    │ │
-│  │  │ • AXIsProcess-      │  │ • KEYEVENTF_UNICODE       │    │ │
-│  │  │   Trusted check     │  │ • No special permissions   │    │ │
-│  │  │ • Accessibility     │  │   (admin for UAC only)     │    │ │
-│  │  │   permission prompt │  │                            │    │ │
-│  │  │ • enigo for Unicode │  │ • enigo for event dispatch │    │ │
-│  │  └─────────────────────┘  └───────────────────────────┘    │ │
-│  └─────────────────────────────────────────────────────────────┘ │
-└──────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                         TypePaste App                                │
+│                                                                      │
+│  ┌────────────┐  ┌────────────────┐  ┌────────────────────────────┐ │
+│  │  CLI Mode  │  │  Tray Mode     │  │      TypeEngine             │ │
+│  │  (clap)    │  │  (tray-icon +  │  │                             │ │
+│  │            │  │   global-      │  │  • type_text()              │ │
+│  │ • type     │  │   hotkey)      │  │  • type_text_to_window()   │ │
+│  │ • list-    │  │                │  │  • paste_as_keystrokes()   │ │
+│  │   windows  │  │  • Paste       │  │  • read_clipboard()        │ │
+│  │ • settings │  │  • Settings    │  │                             │ │
+│  │            │  │  • Quit        │  └──────────┬─────────────────┘ │
+│  └──────┬─────┘  └──────┬─────────┘             │                   │
+│         │               │                       ▼                   │
+│  ┌──────┴───────────────┴───────────────────────────────────────┐   │
+│  │                    Platform Layer                              │   │
+│  │                                                                │   │
+│  │  ┌────────────────────────┐  ┌──────────────────────────────┐ │   │
+│  │  │        macOS           │  │         Windows               │ │   │
+│  │  │                        │  │                               │ │   │
+│  │  │ • CGEvent + enigo      │  │ • SendInput + enigo           │ │   │
+│  │  │ • AXIsProcessTrusted   │  │ • KEYEVENTF_UNICODE          │ │   │
+│  │  │ • osascript for        │  │ • EnumWindows /               │ │   │
+│  │  │   window management    │  │   SetForegroundWindow         │ │   │
+│  │  └────────────────────────┘  └──────────────────────────────┘ │   │
+│  └────────────────────────────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Module Structure
 
 ```
 src/
-├── main.rs              # App entry: event loop, tray, hotkeys
-├── engine.rs            # Core logic: clipboard → keystrokes
+├── main.rs              # Entry point: CLI dispatch or tray mode
+├── cli.rs               # Clap argument definitions
+├── engine.rs            # Core logic: text → keystrokes
 ├── config.rs            # Persistent JSON config
 ├── error.rs             # Error types
+├── ui/
+│   ├── mod.rs           # UI module
+│   └── settings.rs      # Settings GUI (eframe/egui)
 └── platform/
-    ├── mod.rs           # Platform dispatch
-    ├── macos.rs         # macOS: CGEvent + Accessibility
-    ├── windows.rs       # Windows: SendInput
+    ├── mod.rs           # Platform dispatch + WindowInfo
+    ├── macos.rs         # macOS: CGEvent + AppleScript
+    ├── windows.rs       # Windows: SendInput + Win32
     └── fallback.rs      # Stub for unsupported platforms
-```
-
-### Key Design Decisions
-
-| Decision | Rationale |
-|----------|-----------|
-| **Rust** | Single binary, no runtime deps, safe FFI, cross-platform |
-| **enigo** crate | Battle-tested keyboard/mouse simulation on macOS/Windows |
-| **arboard** crate | Cross-platform clipboard access |
-| **tray-icon + global-hotkey** | Lightweight system tray + OS-level hotkeys without a heavy GUI framework |
-| **Per-character emission** | Maximum compatibility — works even where `SendInput` batch fails |
-| **Base + random delay** | Fixed minimum interval + jitter simulates human-like typing |
-
-### Data Flow
-
-```
-User presses Cmd+Shift+V
-        │
-        ▼
-Global Hotkey captured (global-hotkey crate)
-        │
-        ▼
-TypeEngine::paste_as_keystrokes()
-        │
-        ├─► check_accessibility() — macOS: AXIsProcessTrusted
-        │                           Windows: noop
-        │
-        ├─► read_clipboard() — arboard::Clipboard::get_text()
-        │
-        ├─► sleep(initial_delay_ms) — user switches to target window
-        │
-        └─► type_string(text, config)
-                │
-                ├─► for each char in text:
-                │       match char:
-                │         '\n' → Key::Return
-                │         '\t' → Key::Tab
-                │         '\r' → skip
-                │         _   → enigo.text(char)
-                │
-                │       delay = keystroke_delay_ms
-                │             + rand(random_delay_min_ms..=random_delay_max_ms)
-                │       sleep(delay)
-                │
-                └─► Done
 ```
 
 ## Installation
@@ -128,7 +87,7 @@ cd typepaste
 # Build
 cargo build --release
 
-# Run
+# Run (tray mode)
 ./target/release/typepaste
 ```
 
@@ -140,6 +99,99 @@ On first run, macOS will ask for Accessibility permissions:
 ### Windows specific
 
 No special permissions needed. For injecting into admin/elevated windows, run TypePaste as Administrator.
+
+## Usage
+
+### Tray Mode (default)
+
+```bash
+# Launch as system tray app with global hotkey
+typepaste
+```
+
+Press `Cmd+Shift+V` (macOS) / `Ctrl+Shift+V` (Windows) to type clipboard contents into the focused window.
+
+### CLI Mode
+
+#### Type text from argument
+
+```bash
+typepaste type "Hello, World!"
+```
+
+#### Type text from clipboard
+
+```bash
+typepaste type --clipboard
+# or short form:
+typepaste type -c
+```
+
+#### Type text from stdin (pipe)
+
+```bash
+echo "ls -la" | typepaste type --stdin
+cat script.sh | typepaste type --stdin
+```
+
+#### Target a specific window by title
+
+```bash
+# Focus a window whose title contains "Terminal", then type
+typepaste type "ls -la" --window "Terminal"
+
+# Short form:
+typepaste type "ls -la" -w "Terminal"
+```
+
+#### Target a specific window by PID
+
+```bash
+typepaste type "ls -la" --pid 12345
+# Short form:
+typepaste type "ls -la" -p 12345
+```
+
+#### Override delays from CLI
+
+```bash
+# Slow typing with human-like jitter
+typepaste type "slow text" --delay 50 --random-min 10 --random-max 80
+
+# Skip initial delay entirely (useful in scripts)
+typepaste type "fast" --no-delay
+```
+
+#### List available windows
+
+```bash
+# Human-readable table
+typepaste list-windows
+
+# JSON output (for scripts / MCP server)
+typepaste list-windows --json
+```
+
+#### Open settings GUI
+
+```bash
+typepaste settings
+```
+
+### MCP Server Integration (planned)
+
+The CLI mode is designed to be the foundation for an MCP server that enables agent-based work through RDP terminals:
+
+```bash
+# Example future workflow:
+# 1. Agent finds the target window
+typepaste list-windows --json
+
+# 2. Agent sends commands via keystroke emulation
+typepaste type "cd /var/log && tail -f syslog" --window "Remote Desktop" --no-delay
+
+# 3. Agent captures screen (future feature) + extracts text via LLM
+```
 
 ## Configuration
 
@@ -156,11 +208,45 @@ Config is stored at:
   "show_notification": true,
   "start_on_login": false,
   "hotkey": "Cmd+Shift+V",
+  "paste_hotkey": "",
   "max_text_length": 100000,
   "newlines_as_enter": true,
   "tabs_as_tab": true
 }
 ```
+
+### Hotkey configuration
+
+TypePaste supports two hotkeys for triggering paste-as-keystrokes:
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `hotkey` | Cmd+Shift+V / Ctrl+Shift+V | Primary global hotkey |
+| `paste_hotkey` | (empty — disabled) | Optional additional hotkey |
+
+Both hotkeys trigger the same action — paste clipboard text via keystroke emulation. The additional hotkey is useful if you want different shortcuts for different workflows or keyboard layouts.
+
+**Hotkey format:** `Modifier+Modifier+Key`
+
+Supported modifiers: `Cmd` / `Ctrl` / `Shift` / `Alt` / `Option` / `Meta` / `Super`
+
+Supported keys:
+- Letters: `A`–`Z`
+- Digits: `0`–`9`
+- Function keys: `F1`–`F12`
+- Special: `Space`, `Enter`, `Tab`, `Esc`, `Backspace`, `Delete`, `Home`, `End`, `PageUp`, `PageDown`, `Up`, `Down`, `Left`, `Right`
+
+**Examples:**
+
+```
+Cmd+Shift+V          ← macOS default
+Ctrl+Shift+V         ← Windows default
+Ctrl+Alt+P           ← custom alternative
+Cmd+F6               ← function key variant
+Ctrl+Shift+Space     ← space-based shortcut
+```
+
+Hotkey changes made in the Settings GUI are applied immediately — no restart required.
 
 ### Delay settings explained
 
@@ -186,7 +272,6 @@ Each keystroke waits: **`keystroke_delay_ms` + random(`random_delay_min_ms` .. `
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `hotkey` | Cmd+Shift+V / Ctrl+Shift+V | Global hotkey trigger |
 | `max_text_length` | 100000 | Safety limit to prevent accidental huge pastes |
 | `newlines_as_enter` | true | Convert `\n` to Enter key presses |
 | `tabs_as_tab` | true | Convert `\t` to Tab key presses |
@@ -199,6 +284,8 @@ Each keystroke waits: **`keystroke_delay_ms` + random(`random_delay_min_ms` .. `
 - **Windows login screen** where Ctrl+V is disabled
 - **Security-restricted apps** that block paste
 - **Password managers** → copy password → TypePaste into locked field
+- **Automation / scripting** — pipe text into any application via CLI
+- **MCP server** — agent-based work through remote terminals (planned)
 
 ## Roadmap
 
@@ -206,9 +293,14 @@ Each keystroke waits: **`keystroke_delay_ms` + random(`random_delay_min_ms` .. `
 - [x] System tray + global hotkey
 - [x] Persistent configuration
 - [x] Random delay jitter for human-like typing
+- [x] Settings GUI window (eframe/egui)
+- [x] Customizable hotkeys (primary + additional, hot-reload)
+- [x] CLI mode with clap (type, list-windows, settings)
+- [x] Window targeting by title/PID
+- [x] stdin/pipe support
+- [ ] MCP server integration
 - [ ] macOS `.app` bundle with proper Info.plist
 - [ ] Windows installer (MSI/NSIS)
-- [ ] Settings GUI window
 - [ ] Typing progress indicator / cancel button
 - [ ] Linux support (X11/Wayland via xdotool/ydotool)
 - [ ] Auto-update mechanism
