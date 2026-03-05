@@ -1,268 +1,348 @@
 //! macOS implementation using CGEvent API for keystroke emulation.
 //!
-//! ## How it works
-//!
-//! On macOS, we use two approaches depending on the character:
-//!
-//! 1. **CGEvent keyboard events** — for standard ASCII characters, we create
-//!    CGEvent keyboard events with the appropriate virtual keycodes and post
-//!    them to the HID event tap. This is the most reliable method for
-//!    injecting keystrokes into remote desktop sessions, VMs, etc.
-//!
-//! 2. **enigo fallback** — for Unicode characters that don't have a direct
-//!    keycode mapping, we use enigo's `text()` method which leverages
-//!    CGEventKeyboardSetUnicodeString under the hood.
-//!
-//! ## Permissions
-//!
-//! The app requires Accessibility permissions (System Settings → Privacy &
-//! Security → Accessibility). Without this, CGEvent posting will silently fail.
+//! Uses Core Graphics (CGEvent) to synthesize keyboard events at the OS level.
+//! This approach works even in applications that block clipboard paste,
+//! remote desktop sessions, VMs, and terminal emulators.
 
+use std::collections::HashMap;
+use std::thread;
+use std::time::Duration;
+
+use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGKeyCode};
+use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use log::{debug, info, warn};
-use rand::Rng;
 
 use crate::config::Config;
 use crate::error::{Result, TypePasteError};
-use super::WindowInfo;
 
-/// Check if the application has Accessibility permissions on macOS.
-///
-/// If not granted, returns an error with instructions.
-pub fn check_accessibility() -> Result<()> {
-    unsafe {
-        let trusted = macos_accessibility_check();
-        if !trusted {
-            return Err(TypePasteError::AccessibilityDenied);
+/// Implements keystroke emulation on macOS using CGEvent.
+pub struct MacOSPlatform {
+    config: Config,
+}
+
+impl MacOSPlatform {
+    pub fn new(config: Config) -> Self {
+        Self { config }
+    }
+
+    /// Type a string by emitting individual keystrokes.
+    pub fn type_string(&self, text: &str) -> Result<()> {
+        if text.is_empty() {
+            return Ok(());
+        }
+
+        info!("Typing {} characters on macOS", text.len());
+
+        let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+            .map_err(|_| TypePasteError::Platform("Failed to create CGEventSource".into()))?;
+
+        // Handle layout switching if enabled
+        if self.config.layout_switch.enabled && self.config.layout_switch.layouts.len() > 1 {
+            return self.type_string_with_layout_switch(text, &source);
+        }
+
+        self.type_string_direct(text, &source)
+    }
+
+    /// Type text without layout switching (standard path).
+    fn type_string_direct(&self, text: &str, source: &CGEventSource) -> Result<()> {
+        // Apply initial delay
+        if self.config.initial_delay_ms > 0 {
+            thread::sleep(Duration::from_millis(self.config.initial_delay_ms));
+        }
+
+        for ch in text.chars() {
+            self.type_char(ch, source)?;
+            self.apply_delay();
+        }
+
+        Ok(())
+    }
+
+    /// Type text with automatic keyboard layout switching.
+    ///
+    /// Detects when the script changes (e.g. Latin → Cyrillic) and emits
+    /// the configured layout switch hotkey before typing the next character.
+    fn type_string_with_layout_switch(&self, text: &str, source: &CGEventSource) -> Result<()> {
+        let ls = &self.config.layout_switch;
+
+        // Apply initial delay
+        if self.config.initial_delay_ms > 0 {
+            thread::sleep(Duration::from_millis(self.config.initial_delay_ms));
+        }
+
+        let mut current_layout: usize = 0; // assume first layout is active
+
+        for ch in text.chars() {
+            // Determine the required layout for this character
+            if let Some(target_layout) = ls.layout_for_char(ch) {
+                if target_layout != current_layout {
+                    let presses = ls.presses_needed(current_layout, target_layout);
+                    info!(
+                        "Layout switch: {} → {} ({} press(es)) before '{}'",
+                        ls.layouts[current_layout].name,
+                        ls.layouts[target_layout].name,
+                        presses,
+                        ch
+                    );
+                    for _ in 0..presses {
+                        self.press_layout_switch_hotkey(source)?;
+                        thread::sleep(Duration::from_millis(ls.switch_delay_ms));
+                    }
+                    current_layout = target_layout;
+                }
+            }
+            // Neutral characters (digits, punctuation) — no layout switch needed
+
+            self.type_char(ch, source)?;
+            self.apply_delay();
+        }
+
+        Ok(())
+    }
+
+    /// Press the layout switch hotkey (e.g. Alt+Shift) on macOS.
+    fn press_layout_switch_hotkey(&self, source: &CGEventSource) -> Result<()> {
+        let hotkey = &self.config.layout_switch.switch_hotkey;
+        debug!("Pressing layout switch hotkey: {}", hotkey);
+
+        // Parse the hotkey string
+        let (modifiers, key_code) = parse_hotkey_to_cg(hotkey)
+            .ok_or_else(|| TypePasteError::Platform(
+                format!("Cannot parse layout switch hotkey: {hotkey}")
+            ))?;
+
+        emit_key_with_modifiers(source, key_code, modifiers)?;
+        Ok(())
+    }
+
+    /// Emit a single character as a key event.
+    fn type_char(&self, ch: char, source: &CGEventSource) -> Result<()> {
+        // For Unicode characters, use CGEventKeyboardSetUnicodeString
+        // This is the most reliable method for arbitrary Unicode input
+        let key_event = CGEvent::new_keyboard_event(source.clone(), 0, true)
+            .map_err(|_| TypePasteError::Platform("Failed to create key down event".into()))?;
+
+        key_event.set_string(&ch.to_string());
+        key_event.post(CGEventTapLocation::HID);
+
+        let key_up = CGEvent::new_keyboard_event(source.clone(), 0, false)
+            .map_err(|_| TypePasteError::Platform("Failed to create key up event".into()))?;
+        key_up.set_string("");
+        key_up.post(CGEventTapLocation::HID);
+
+        Ok(())
+    }
+
+    /// Handle special characters (newlines, tabs) if configured.
+    fn handle_special_char(&self, ch: char, source: &CGEventSource) -> Option<Result<()>> {
+        match ch {
+            '\n' if self.config.newlines_as_enter => {
+                Some(emit_key(source, KEY_RETURN, false))
+            }
+            '\t' if self.config.tabs_as_tab => {
+                Some(emit_key(source, KEY_TAB, false))
+            }
+            _ => None,
         }
     }
-    debug!("Accessibility permission granted");
+
+    /// Apply per-keystroke delay (base + optional random jitter).
+    fn apply_delay(&self) {
+        let base = self.config.keystroke_delay_ms;
+        let delay = if self.config.has_random_delay() {
+            use rand::Rng;
+            let jitter = rand::thread_rng().gen_range(
+                self.config.random_delay_min_ms..=self.config.random_delay_max_ms
+            );
+            base + jitter
+        } else {
+            base
+        };
+        if delay > 0 {
+            thread::sleep(Duration::from_millis(delay));
+        }
+    }
+
+    /// List all visible windows using CGWindowListCopyWindowInfo.
+    pub fn list_windows(&self) -> Result<Vec<crate::platform::WindowInfo>> {
+        use core_foundation::array::CFArray;
+        use core_foundation::base::TCFType;
+        use core_foundation::dictionary::CFDictionary;
+        use core_foundation::number::CFNumber;
+        use core_foundation::string::CFString;
+        use core_graphics::window::{{
+            CGWindowListCopyWindowInfo, CGWindowListOption, kCGWindowListOptionOnScreenOnly,
+            kCGWindowListExcludeDesktopElements, kCGNullWindowID,
+        }};
+
+        let options = kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements;
+        let window_list = unsafe {
+            CGWindowListCopyWindowInfo(options, kCGNullWindowID)
+        };
+
+        if window_list.is_null() {
+            return Ok(vec![]);
+        }
+
+        let array: CFArray<CFDictionary> = unsafe { CFArray::wrap_under_get_rule(window_list) };
+        let mut windows = Vec::new();
+
+        for dict in array.iter() {
+            let pid = get_dict_number(&dict, "kCGWindowOwnerPID").unwrap_or(0) as u32;
+            let app_name = get_dict_string(&dict, "kCGWindowOwnerName")
+                .unwrap_or_default();
+            let title = get_dict_string(&dict, "kCGWindowName")
+                .unwrap_or_default();
+            let layer = get_dict_number(&dict, "kCGWindowLayer").unwrap_or(999);
+
+            // Only include normal windows (layer 0)
+            if layer == 0 && pid > 0 {
+                windows.push(crate::platform::WindowInfo { pid, app_name, title });
+            }
+        }
+
+        Ok(windows)
+    }
+
+    /// Focus a window by PID and optionally title, then type into it.
+    pub fn type_to_window(&self, text: &str, pid: u32, _title: Option<&str>) -> Result<()> {
+        use std::process::Command;
+
+        // Use AppleScript to bring the app to front
+        let script = format!(
+            "tell application \"System Events\" to set frontmost of (first process whose unix id is {pid}) to true"
+        );
+        let status = Command::new("osascript")
+            .args(["-e", &script])
+            .status()
+            .map_err(|e| TypePasteError::Platform(format!("osascript failed: {e}")));
+
+        match status {
+            Ok(s) if s.success() => {
+                debug!("Focused window with PID {pid}");
+                // Brief pause to allow window to come to front
+                thread::sleep(Duration::from_millis(200));
+            }
+            Ok(s) => {
+                warn!("osascript exited with status {s}, proceeding anyway");
+            }
+            Err(e) => {
+                warn!("Failed to focus window: {e}, proceeding anyway");
+            }
+        }
+
+        self.type_string(text)
+    }
+}
+
+// ─── CGEvent helpers ───────────────────────────────────────────────────────────
+
+/// macOS virtual key codes for special keys.
+const KEY_RETURN: CGKeyCode = 0x24;
+const KEY_TAB: CGKeyCode = 0x30;
+const KEY_SHIFT: CGKeyCode = 0x38;
+const KEY_CONTROL: CGKeyCode = 0x3B;
+const KEY_ALT: CGKeyCode = 0x3A;    // Option key
+const KEY_CMD: CGKeyCode = 0x37;    // Command key
+
+/// Emit a key press+release without modifiers.
+fn emit_key(source: &CGEventSource, code: CGKeyCode, _is_unicode: bool) -> Result<()> {
+    let down = CGEvent::new_keyboard_event(source.clone(), code, true)
+        .map_err(|_| TypePasteError::Platform("Failed to create key event".into()))?;
+    down.post(CGEventTapLocation::HID);
+
+    let up = CGEvent::new_keyboard_event(source.clone(), code, false)
+        .map_err(|_| TypePasteError::Platform("Failed to create key event".into()))?;
+    up.post(CGEventTapLocation::HID);
     Ok(())
 }
 
-/// FFI call to AXIsProcessTrustedWithOptions
-unsafe fn macos_accessibility_check() -> bool {
+/// Emit a key press with the given modifier flags.
+fn emit_key_with_modifiers(
+    source: &CGEventSource,
+    code: CGKeyCode,
+    flags: CGEventFlags,
+) -> Result<()> {
+    let down = CGEvent::new_keyboard_event(source.clone(), code, true)
+        .map_err(|_| TypePasteError::Platform("Failed to create key event".into()))?;
+    down.set_flags(flags);
+    down.post(CGEventTapLocation::HID);
+
+    let up = CGEvent::new_keyboard_event(source.clone(), code, false)
+        .map_err(|_| TypePasteError::Platform("Failed to create key event".into()))?;
+    up.set_flags(CGEventFlags::empty());
+    up.post(CGEventTapLocation::HID);
+    Ok(())
+}
+
+/// Parse a hotkey string (e.g. "Alt+Shift", "Ctrl+Shift") into
+/// (CGEventFlags, CGKeyCode). The last non-modifier token is the key.
+fn parse_hotkey_to_cg(s: &str) -> Option<(CGEventFlags, CGKeyCode)> {
+    let mut flags = CGEventFlags::empty();
+    let mut key_code: Option<CGKeyCode> = None;
+
+    for part in s.split('+').map(|p| p.trim()) {
+        match part.to_lowercase().as_str() {
+            "shift" => flags |= CGEventFlags::CGEventFlagShift,
+            "ctrl" | "control" => flags |= CGEventFlags::CGEventFlagControl,
+            "alt" | "option" => flags |= CGEventFlags::CGEventFlagAlternate,
+            "cmd" | "command" | "meta" | "super" => flags |= CGEventFlags::CGEventFlagCommand,
+            key => {
+                // Map common key names to CGKeyCode
+                key_code = match key {
+                    "space" => Some(0x31),
+                    "shift" => Some(KEY_SHIFT),    // shouldn't happen but guard it
+                    "alt" | "option" => Some(KEY_ALT),
+                    "ctrl" | "control" => Some(KEY_CONTROL),
+                    "cmd" | "command" => Some(KEY_CMD),
+                    // Letters a-z → CGKeyCode mapping (US layout)
+                    "a" => Some(0x00), "b" => Some(0x0B), "c" => Some(0x08),
+                    "d" => Some(0x02), "e" => Some(0x0E), "f" => Some(0x03),
+                    "g" => Some(0x05), "h" => Some(0x04), "i" => Some(0x22),
+                    "j" => Some(0x26), "k" => Some(0x28), "l" => Some(0x25),
+                    "m" => Some(0x2E), "n" => Some(0x2D), "o" => Some(0x1F),
+                    "p" => Some(0x23), "q" => Some(0x0C), "r" => Some(0x0F),
+                    "s" => Some(0x01), "t" => Some(0x11), "u" => Some(0x20),
+                    "v" => Some(0x09), "w" => Some(0x0D), "x" => Some(0x07),
+                    "y" => Some(0x10), "z" => Some(0x06),
+                    _ => None,
+                };
+            }
+        }
+    }
+
+    key_code.map(|kc| (flags, kc))
+}
+
+// ─── CoreFoundation helpers ────────────────────────────────────────────────────
+
+fn get_dict_number(dict: &core_foundation::dictionary::CFDictionary, key: &str) -> Option<i64> {
     use core_foundation::base::TCFType;
-    use core_foundation::boolean::CFBoolean;
-    use core_foundation::dictionary::CFDictionary;
+    use core_foundation::number::CFNumber;
     use core_foundation::string::CFString;
 
-    extern "C" {
-        fn AXIsProcessTrustedWithOptions(
-            options: core_foundation::base::CFTypeRef,
-        ) -> bool;
-    }
-
-    // kAXTrustedCheckOptionPrompt = true → show the system prompt
-    let key = CFString::new("AXTrustedCheckOptionPrompt");
-    let value = CFBoolean::true_value();
-    let options = CFDictionary::from_CFType_pairs(&[(key.as_CFType(), value.as_CFType())]);
-
-    AXIsProcessTrustedWithOptions(options.as_CFTypeRef())
+    let key = CFString::new(key);
+    dict.find(&key).and_then(|val| {
+        let num: core_foundation::number::CFNumber = unsafe {
+            core_foundation::base::TCFType::wrap_under_get_rule(*val as _)
+        };
+        num.to_i64()
+    })
 }
 
-/// Compute the delay for a single keystroke: base + optional random jitter.
-fn compute_delay(config: &Config) -> std::time::Duration {
-    let base = config.keystroke_delay_ms;
-    let jitter = if config.has_random_delay() {
-        let mut rng = rand::thread_rng();
-        rng.gen_range(config.random_delay_min_ms..=config.random_delay_max_ms)
-    } else {
-        0
-    };
-    std::time::Duration::from_millis(base + jitter)
-}
+fn get_dict_string(
+    dict: &core_foundation::dictionary::CFDictionary,
+    key: &str,
+) -> Option<String> {
+    use core_foundation::base::TCFType;
+    use core_foundation::string::CFString;
 
-/// Type a string by emitting individual keystroke events.
-pub fn type_string(text: &str, config: &Config) -> Result<()> {
-    use enigo::{Enigo, Keyboard, Settings};
-
-    let mut enigo = Enigo::new(&Settings::default())
-        .map_err(|e| TypePasteError::Keystroke(format!("Init enigo: {e}")))?;
-
-    for ch in text.chars() {
-        match ch {
-            '\n' if config.newlines_as_enter => {
-                enigo
-                    .key(enigo::Key::Return, enigo::Direction::Click)
-                    .map_err(|e| TypePasteError::Keystroke(format!("Return key: {e}")))?;
-            }
-            '\t' if config.tabs_as_tab => {
-                enigo
-                    .key(enigo::Key::Tab, enigo::Direction::Click)
-                    .map_err(|e| TypePasteError::Keystroke(format!("Tab key: {e}")))?;
-            }
-            '\r' => {
-                // Skip carriage returns (handle \r\n as just \n)
-                continue;
-            }
-            _ => {
-                // Use enigo's text() for individual characters — handles Unicode
-                let s = ch.to_string();
-                enigo
-                    .text(&s)
-                    .map_err(|e| TypePasteError::Keystroke(format!("Char '{ch}': {e}")))?;
-            }
-        }
-
-        let delay = compute_delay(config);
-        if !delay.is_zero() {
-            std::thread::sleep(delay);
-        }
-    }
-
-    Ok(())
-}
-
-/// Focus a window whose title contains the given substring (case-insensitive).
-///
-/// Uses AppleScript `System Events` to find and activate the matching window.
-/// Returns the PID and title of the focused window.
-pub fn focus_window_by_title(title: &str) -> Result<(u32, String)> {
-    use std::process::Command;
-
-    // AppleScript: iterate over all processes and windows, find matching title
-    let script = format!(
-        r#"
-        tell application "System Events"
-            set matchedApp to ""
-            set matchedWin to ""
-            set matchedPID to 0
-            repeat with proc in (every process whose background only is false)
-                try
-                    repeat with win in (every window of proc)
-                        set winTitle to name of win
-                        if winTitle contains "{title}" then
-                            set matchedApp to name of proc
-                            set matchedWin to winTitle
-                            set matchedPID to unix id of proc
-                            tell proc to set frontmost to true
-                            -- Small delay for window to come to front
-                            delay 0.3
-                            return matchedPID & "|" & matchedWin & "|" & matchedApp
-                        end if
-                    end repeat
-                end try
-            end repeat
-            return ""
-        end tell
-        "#
-    );
-
-    let output = Command::new("osascript")
-        .arg("-e")
-        .arg(&script)
-        .output()
-        .map_err(|e| TypePasteError::Platform(format!("osascript exec: {e}")))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if stdout.is_empty() {
-        return Err(TypePasteError::Platform(format!(
-            "No window found matching title: \"{title}\""
-        )));
-    }
-
-    let parts: Vec<&str> = stdout.splitn(3, '|').collect();
-    if parts.len() >= 2 {
-        let pid = parts[0]
-            .trim()
-            .parse::<u32>()
-            .unwrap_or(0);
-        let win_title = parts[1].trim().to_string();
-        info!("Focused window: \"{}\" (PID {})", win_title, pid);
-        Ok((pid, win_title))
-    } else {
-        Err(TypePasteError::Platform(
-            "Failed to parse window focus result".into(),
-        ))
-    }
-}
-
-/// Focus a window owned by the given PID.
-pub fn focus_window_by_pid(pid: u32) -> Result<String> {
-    use std::process::Command;
-
-    let script = format!(
-        r#"
-        tell application "System Events"
-            set targetProc to first process whose unix id is {pid}
-            set frontmost of targetProc to true
-            delay 0.3
-            set procName to name of targetProc
-            try
-                set winName to name of first window of targetProc
-                return winName & "|" & procName
-            on error
-                return "(no window)" & "|" & procName
-            end try
-        end tell
-        "#
-    );
-
-    let output = Command::new("osascript")
-        .arg("-e")
-        .arg(&script)
-        .output()
-        .map_err(|e| TypePasteError::Platform(format!("osascript exec: {e}")))?;
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if !output.status.success() {
-        return Err(TypePasteError::Platform(format!(
-            "No process found with PID {pid}: {stderr}"
-        )));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let parts: Vec<&str> = stdout.splitn(2, '|').collect();
-    let win_title = parts.first().unwrap_or(&"").to_string();
-    info!("Focused PID {} window: \"{}\"", pid, win_title);
-    Ok(win_title)
-}
-
-/// List visible windows with their title, PID, and app name.
-pub fn list_windows() -> Result<Vec<WindowInfo>> {
-    use std::process::Command;
-
-    let script = r#"
-        set output to ""
-        tell application "System Events"
-            repeat with proc in (every process whose background only is false)
-                try
-                    set procPID to unix id of proc
-                    set procName to name of proc
-                    repeat with win in (every window of proc)
-                        set winTitle to name of win
-                        set output to output & procPID & "\t" & procName & "\t" & winTitle & "\n"
-                    end repeat
-                end try
-            end repeat
-        end tell
-        return output
-    "#;
-
-    let output = Command::new("osascript")
-        .arg("-e")
-        .arg(script)
-        .output()
-        .map_err(|e| TypePasteError::Platform(format!("osascript exec: {e}")))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut windows = Vec::new();
-
-    for line in stdout.lines() {
-        let parts: Vec<&str> = line.splitn(3, '\t').collect();
-        if parts.len() == 3 {
-            let pid = parts[0].trim().parse::<u32>().unwrap_or(0);
-            let app_name = parts[1].trim().to_string();
-            let title = parts[2].trim().to_string();
-            if !title.is_empty() {
-                windows.push(WindowInfo {
-                    title,
-                    pid,
-                    app_name,
-                });
-            }
-        }
-    }
-
-    Ok(windows)
+    let key = CFString::new(key);
+    dict.find(&key).map(|val| {
+        let s: CFString = unsafe {
+            core_foundation::base::TCFType::wrap_under_get_rule(*val as _)
+        };
+        s.to_string()
+    })
 }

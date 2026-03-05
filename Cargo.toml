@@ -1,63 +1,58 @@
 [package]
 name = "typepaste"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
-authors = ["f0lken"]
-description = "Paste clipboard text anywhere via keystroke emulation — even into remote desktops that don't support direct paste. CLI + GUI + future MCP server."
+authors = ["hakimaru@gmail.com"]
+description = "Paste text anywhere via keystroke emulation — works in VMs, RDP, and restricted apps"
 license = "MIT"
 repository = "https://github.com/f0lken/typepaste"
-keywords = ["clipboard", "paste", "keystroke", "remote-desktop", "automation"]
-categories = ["os", "accessibility"]
+keywords = ["keyboard", "automation", "remote-desktop", "clipboard", "accessibility"]
+categories = ["command-line-utilities", "accessibility"]
+
+[[bin]]
+name = "typepaste"
+path = "src/main.rs"
 
 [dependencies]
-# Clipboard access
-arboard = "3"
-# Logging
-log = "0.4"
-env_logger = "0.11"
-# Error handling
-thiserror = "2"
-# Serialization for config
+clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# Directories for config storage
-dirs = "6"
-# Random delay jitter
+env_logger = "0.11"
+log = "0.4"
+dirs = "5"
 rand = "0.8"
-# CLI argument parsing
-clap = { version = "4", features = ["derive"] }
-
-# Cross-platform keyboard simulation
-enigo = "0.3"
-
-# Global hotkeys
-global-hotkey = "0.6"
-
-# System tray
-tray-icon = "0.19"
-
-# Event loop (required for tray + hotkeys on all platforms)
-winit = { version = "0.30", features = ["rwh_06"] }
-
-# GUI for settings window
-eframe = "0.29"
+arboard = "0.5"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-core-graphics = "0.24"
-core-foundation = "0.10"
-cocoa = "0.26"
-objc = "0.2"
+core-graphics = { version = "0.23", features = ["highsierra"] }
+core-foundation = "0.9"
+winit = "0.30"
+tray-icon = "0.17"
+global-hotkey = "0.6"
+eframe = "0.29"
+egui = "0.29"
+image = "0.25"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.58", features = [
-    "Win32_UI_Input_KeyboardAndMouse",
-    "Win32_UI_WindowsAndMessaging",
-    "Win32_System_Threading",
+enigo = "0.2"
+winit = "0.30"
+tray-icon = "0.17"
+global-hotkey = "0.6"
+eframe = "0.29"
+egui = "0.29"
+image = "0.25"
+[dependencies.windows]
+version = "0.58"
+features = [
     "Win32_Foundation",
-] }
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
+]
 
 [profile.release]
-opt-level = "z"   # Optimize for size
+opt-level = 3
 lto = true
-strip = true
 codegen-units = 1
+strip = true

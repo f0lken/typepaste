@@ -1,118 +1,111 @@
 //! CLI argument definitions using clap.
 //!
-//! TypePaste supports two modes:
-//! - **Tray mode** (default, no subcommand): system tray + global hotkey
-//! - **CLI mode** (subcommands): headless, scriptable, MCP-ready
-//!
-//! ## Examples
-//!
-//! ```bash
-//! # Tray mode (default)
-//! typepaste
-//!
-//! # Type text from argument
-//! typepaste type "Hello, World!"
-//!
-//! # Type text from clipboard
-//! typepaste type --clipboard
-//!
-//! # Type text from stdin (pipe)
-//! echo "Hello" | typepaste type --stdin
-//!
-//! # Type into a specific window by title substring
-//! typepaste type "ls -la" --window "Terminal"
-//!
-//! # Type into a specific window by PID
-//! typepaste type "ls -la" --pid 12345
-//!
-//! # Override delays from CLI
-//! typepaste type "slow text" --delay 50 --random-min 10 --random-max 80
-//!
-//! # List available windows (for --window / --pid discovery)
-//! typepaste list-windows
-//!
-//! # JSON output for programmatic consumption (MCP server)
-//! typepaste list-windows --json
-//!
-//! # Open settings GUI
-//! typepaste settings
-//! ```
+//! This module defines all CLI subcommands and their arguments.
+//! TypePaste supports both interactive (tray) mode and headless CLI mode.
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
-#[derive(Parser, Debug)]
+/// TypePaste — paste text anywhere as keystrokes.
+///
+/// Without a subcommand, TypePaste runs in system tray mode.
+/// With a subcommand, it runs headlessly (useful for scripting and MCP).
+#[derive(Debug, Parser)]
 #[command(
     name = "typepaste",
     version,
-    about = "Paste text anywhere via keystroke emulation",
-    long_about = "TypePaste emits OS-level keystroke events to type text into any \
-                  window \u2014 even remote desktops, VMs, and applications that block \
-                  clipboard paste. Runs as a system tray app (default) or headless \
-                  via CLI subcommands."
+    about = "Paste text anywhere as keystrokes — works in VMs, RDP, and restricted apps",
+    long_about = None,
 )]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
 }
 
-#[derive(Subcommand, Debug)]
+/// Available CLI subcommands.
+#[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Type text via keystroke emulation (headless CLI mode).
+    /// Type text as keystrokes into the focused window or a specific window.
+    #[command(name = "type")]
     Type(TypeArgs),
 
-    /// List visible windows with their titles and PIDs.
+    /// List all visible windows with their PID, app name, and title.
+    #[command(name = "list-windows")]
     ListWindows(ListWindowsArgs),
 
-    /// Open the settings GUI window.
+    /// Open the settings window.
+    #[command(name = "settings")]
     Settings,
 }
 
-#[derive(Parser, Debug)]
+/// Arguments for the `type` subcommand.
+#[derive(Debug, Args)]
 pub struct TypeArgs {
     /// Text to type. If omitted, reads from --clipboard or --stdin.
     pub text: Option<String>,
 
-    /// Read text from the system clipboard instead of argument.
-    #[arg(long, short = 'c')]
+    /// Read text from the system clipboard.
+    #[arg(long, conflicts_with_all = ["stdin"])]
     pub clipboard: bool,
 
-    /// Read text from stdin (useful for piping).
-    #[arg(long, short = 's')]
+    /// Read text from stdin.
+    #[arg(long, conflicts_with_all = ["clipboard"])]
     pub stdin: bool,
 
-    /// Focus a window by title substring before typing.
-    /// Case-insensitive partial match.
-    #[arg(long, short = 'w')]
+    /// Target window by title (substring match, case-insensitive).
+    #[arg(long, conflicts_with = "pid")]
     pub window: Option<String>,
 
-    /// Focus a window by process ID before typing.
-    #[arg(long, short = 'p')]
+    /// Target window by PID.
+    #[arg(long, conflicts_with = "window")]
     pub pid: Option<u32>,
 
-    /// Override base keystroke delay (ms).
-    #[arg(long, short = 'd')]
+    /// Keystroke delay in milliseconds (overrides config).
+    #[arg(long)]
     pub delay: Option<u64>,
 
-    /// Override random jitter minimum (ms).
+    /// Minimum random delay in milliseconds (overrides config).
     #[arg(long)]
     pub random_min: Option<u64>,
 
-    /// Override random jitter maximum (ms).
+    /// Maximum random delay in milliseconds (overrides config).
     #[arg(long)]
     pub random_max: Option<u64>,
 
-    /// Override initial delay before typing starts (ms).
+    /// Initial delay before typing starts in milliseconds (overrides config).
     #[arg(long)]
     pub initial_delay: Option<u64>,
 
-    /// Skip initial delay entirely (useful in scripts).
+    /// Skip the initial delay entirely.
     #[arg(long)]
     pub no_delay: bool,
+
+    /// Enable automatic keyboard layout switching for remote systems.
+    /// TypePaste will emit the configured layout switch hotkey when it detects
+    /// a script boundary (e.g. Latin → Cyrillic).
+    #[arg(long)]
+    pub layout_switch: bool,
+
+    /// Hotkey used to switch keyboard layouts on the remote system.
+    /// Example: "Alt+Shift", "Ctrl+Shift", "Win+Space".
+    #[arg(long)]
+    pub layout_switch_hotkey: Option<String>,
+
+    /// Delay in milliseconds to wait after pressing the layout switch hotkey.
+    /// The remote OS needs time to actually switch the layout. Default: 100.
+    #[arg(long)]
+    pub layout_switch_delay: Option<u64>,
+
+    /// Initial layout index (0-based) to assume when typing starts.
+    /// 0 = first layout in config (default), 1 = second, etc.
+    /// Useful when the remote system is already in a non-default layout.
+    #[arg(long)]
+    pub initial_layout: Option<usize>,
 }
 
-#[derive(Parser, Debug)]
+/// Arguments for the `list-windows` subcommand.
+#[derive(Debug, Args)]
 pub struct ListWindowsArgs {
-    /// Output as JSON (for programmatic use / MCP server).
-    #[arg(long, short = 'j')]
+    /// Output in JSON format (for programmatic use / MCP).
+    #[arg(long)]
     pub json: bool,
 }

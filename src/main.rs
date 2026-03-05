@@ -117,6 +117,32 @@ fn run_cli(command: Command, mut config: Config) {
             }
             let use_initial_delay = !args.no_delay;
 
+            // Apply CLI layout switching overrides
+            if args.layout_switch || args.layout_switch_hotkey.is_some() {
+                config.layout_switch.enabled = true;
+            }
+            if let Some(ref hotkey) = args.layout_switch_hotkey {
+                config.layout_switch.switch_hotkey = hotkey.clone();
+            }
+            if let Some(delay) = args.layout_switch_delay {
+                config.layout_switch.switch_delay_ms = delay;
+            }
+            // initial_layout is handled in the engine/platform layer
+            // (not directly in config — it's a runtime override)
+            // For now we log it; actual implementation would pass to type_string
+            if let Some(idx) = args.initial_layout {
+                info!("Initial layout index override: {}", idx);
+                // Rearrange layouts so the desired one is at index 0
+                // (since type_string starts from index 0)
+                if idx > 0 && idx < config.layout_switch.layouts.len() {
+                    config.layout_switch.layouts.rotate_left(idx);
+                    info!(
+                        "Layouts rotated: starting with '{}'",
+                        config.layout_switch.layouts[0].name
+                    );
+                }
+            }
+
             let engine = TypeEngine::new(config);
 
             // Dispatch based on window targeting
@@ -191,13 +217,14 @@ struct HotkeyState {
 
 fn run_tray(config: Config) {
     info!(
-        "Config loaded: delay={}ms, random={}..{}ms, initial={}ms, hotkey={}, paste_hotkey={}",
+        "Config loaded: delay={}ms, random={}..{}ms, initial={}ms, hotkey={}, paste_hotkey={}, layout_switch={}",
         config.keystroke_delay_ms,
         config.random_delay_min_ms,
         config.random_delay_max_ms,
         config.initial_delay_ms,
         config.hotkey,
-        if config.paste_hotkey.is_empty() { "(none)" } else { &config.paste_hotkey }
+        if config.paste_hotkey.is_empty() { "(none)" } else { &config.paste_hotkey },
+        if config.layout_switch.enabled { "on" } else { "off" }
     );
 
     // Create the engine
@@ -481,48 +508,33 @@ fn parse_hotkey(s: &str) -> Option<HotKey> {
                         "down" => Some(Code::ArrowDown),
                         "left" => Some(Code::ArrowLeft),
                         "right" => Some(Code::ArrowRight),
-                        _ => None,
+                        _ => {
+                            warn!("Unknown key: {key}");
+                            None
+                        }
                     };
                 }
             }
         }
     }
 
-    code.map(|c| HotKey::new(Some(modifiers), c))
+    if let Some(code) = code {
+        Some(HotKey::new(Some(modifiers), code))
+    } else {
+        warn!("Could not parse hotkey: {s}");
+        None
+    }
 }
 
-/// Load or generate the tray icon.
+/// Load tray icon from embedded bytes (PNG).
 fn load_tray_icon() -> tray_icon::Icon {
-    let size = 32u32;
-    let mut rgba = vec![0u8; (size * size * 4) as usize];
-
-    for y in 0..size {
-        for x in 0..size {
-            let idx = ((y * size + x) * 4) as usize;
-            let in_border = x < 2 || x >= size - 2 || y < 2 || y >= size - 2;
-            let in_clip = x >= 10 && x <= 22 && y <= 6;
-            let in_body = x >= 4 && x <= 28 && y >= 4 && y <= 28;
-
-            if in_clip {
-                rgba[idx] = 100;
-                rgba[idx + 1] = 100;
-                rgba[idx + 2] = 100;
-                rgba[idx + 3] = 255;
-            } else if in_body && in_border {
-                rgba[idx] = 60;
-                rgba[idx + 1] = 60;
-                rgba[idx + 2] = 60;
-                rgba[idx + 3] = 255;
-            } else if in_body {
-                rgba[idx] = 220;
-                rgba[idx + 1] = 220;
-                rgba[idx + 2] = 240;
-                rgba[idx + 3] = 255;
-            } else {
-                rgba[idx + 3] = 0;
-            }
-        }
-    }
-
-    tray_icon::Icon::from_rgba(rgba, size, size).expect("Failed to create tray icon")
+    // 16x16 PNG icon embedded at compile time
+    // For production, use a proper icon file
+    let icon_bytes = include_bytes!("../assets/icon.png");
+    let image = image::load_from_memory(icon_bytes)
+        .expect("Failed to load tray icon")
+        .into_rgba8();
+    let (width, height) = image.dimensions();
+    let rgba = image.into_raw();
+    tray_icon::Icon::from_rgba(rgba, width, height).expect("Failed to create tray icon")
 }
