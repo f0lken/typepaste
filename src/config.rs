@@ -7,8 +7,19 @@ use crate::error::{Result, TypePasteError};
 /// Application configuration persisted to disk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    /// Delay between individual keystrokes in milliseconds.
+    /// Base delay between individual keystrokes in milliseconds.
+    /// Applied to every keystroke as a fixed minimum interval.
     pub keystroke_delay_ms: u64,
+
+    /// Minimum random delay added on top of the base delay (ms).
+    /// Set both min and max to 0 to disable random jitter.
+    pub random_delay_min_ms: u64,
+
+    /// Maximum random delay added on top of the base delay (ms).
+    /// Each keystroke gets: base + rand(min..=max) total delay.
+    /// This simulates human-like typing cadence and can help with
+    /// systems that detect automated input.
+    pub random_delay_max_ms: u64,
 
     /// Initial delay before starting to type (ms).
     /// Gives user time to focus the target window.
@@ -37,6 +48,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             keystroke_delay_ms: 5,
+            random_delay_min_ms: 0,
+            random_delay_max_ms: 0,
             initial_delay_ms: 500,
             show_notification: true,
             start_on_login: false,
@@ -84,5 +97,18 @@ impl Config {
             .map_err(|e| TypePasteError::Config(format!("Serialize error: {e}")))?;
         fs::write(&path, json)?;
         Ok(())
+    }
+
+    /// Whether random delay jitter is enabled.
+    pub fn has_random_delay(&self) -> bool {
+        self.random_delay_max_ms > 0
+    }
+
+    /// Validate configuration values and fix inconsistencies.
+    pub fn validate(&mut self) {
+        // Ensure min <= max for random delay
+        if self.random_delay_min_ms > self.random_delay_max_ms {
+            std::mem::swap(&mut self.random_delay_min_ms, &mut self.random_delay_max_ms);
+        }
     }
 }

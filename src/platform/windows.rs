@@ -19,6 +19,7 @@
 //! process to also run elevated.
 
 use log::debug;
+use rand::Rng;
 
 use crate::config::Config;
 use crate::error::{Result, TypePasteError};
@@ -31,14 +32,24 @@ pub fn check_accessibility() -> Result<()> {
     Ok(())
 }
 
+/// Compute the delay for a single keystroke: base + optional random jitter.
+fn compute_delay(config: &Config) -> std::time::Duration {
+    let base = config.keystroke_delay_ms;
+    let jitter = if config.has_random_delay() {
+        let mut rng = rand::thread_rng();
+        rng.gen_range(config.random_delay_min_ms..=config.random_delay_max_ms)
+    } else {
+        0
+    };
+    std::time::Duration::from_millis(base + jitter)
+}
+
 /// Type a string by emitting individual keystroke events via SendInput.
 pub fn type_string(text: &str, config: &Config) -> Result<()> {
     use enigo::{Enigo, Keyboard, Settings};
 
     let mut enigo = Enigo::new(&Settings::default())
         .map_err(|e| TypePasteError::Keystroke(format!("Init enigo: {e}")))?;
-
-    let delay = std::time::Duration::from_millis(config.keystroke_delay_ms);
 
     for ch in text.chars() {
         match ch {
@@ -66,7 +77,8 @@ pub fn type_string(text: &str, config: &Config) -> Result<()> {
             }
         }
 
-        if config.keystroke_delay_ms > 0 {
+        let delay = compute_delay(config);
+        if !delay.is_zero() {
             std::thread::sleep(delay);
         }
     }

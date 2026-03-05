@@ -55,9 +55,24 @@ impl TypeEngine {
             &text
         };
 
-        info!("Typing {} characters as keystrokes", text.len());
+        // 4. Log delay info
+        if self.config.has_random_delay() {
+            info!(
+                "Typing {} chars | base delay: {}ms | random jitter: {}..{}ms",
+                text.len(),
+                self.config.keystroke_delay_ms,
+                self.config.random_delay_min_ms,
+                self.config.random_delay_max_ms
+            );
+        } else {
+            info!(
+                "Typing {} chars | fixed delay: {}ms",
+                text.len(),
+                self.config.keystroke_delay_ms
+            );
+        }
 
-        // 4. Initial delay — let user focus the target window
+        // 5. Initial delay — let user focus the target window
         if self.config.initial_delay_ms > 0 {
             debug!(
                 "Waiting {}ms before starting...",
@@ -66,7 +81,7 @@ impl TypeEngine {
             std::thread::sleep(std::time::Duration::from_millis(self.config.initial_delay_ms));
         }
 
-        // 5. Type each character
+        // 6. Type each character
         platform::type_string(text, &self.config)?;
 
         info!("Done typing");

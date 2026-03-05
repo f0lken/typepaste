@@ -16,7 +16,8 @@ TypePaste reads text from your clipboard and "types" it out character by charact
 - **Global hotkey** — `Cmd+Shift+V` (macOS) / `Ctrl+Shift+V` (Windows)
 - **System tray** — minimal UI, always accessible
 - **Unicode support** — handles special characters, not just ASCII
-- **Configurable delays** — adjust typing speed for slow remote connections
+- **Configurable delays** — fixed base delay + optional random jitter
+- **Human-like typing** — random delay range simulates natural input cadence
 - **Newlines & tabs** — properly handles multi-line text
 - **Safety limits** — max text length to prevent accidental mega-pastes
 
@@ -35,6 +36,7 @@ TypePaste reads text from your clipboard and "types" it out character by charact
 │  │ • Quit      │  │ Cmd+Shift+V │  │    (configurable)       │ │
 │  └─────────────┘  │ Ctrl+Shift+V│  │ 3. Emit keystrokes      │ │
 │                   └──────────────┘  │    per character         │ │
+│                                     │ 4. base + random delay  │ │
 │                                     └──────────┬──────────────┘ │
 │                                                │                │
 │  ┌─────────────────────────────────────────────▼──────────────┐ │
@@ -78,7 +80,7 @@ src/
 | **arboard** crate | Cross-platform clipboard access |
 | **tray-icon + global-hotkey** | Lightweight system tray + OS-level hotkeys without a heavy GUI framework |
 | **Per-character emission** | Maximum compatibility — works even where `SendInput` batch fails |
-| **Configurable delay** | Slow remote connections (satellite, VPN) may drop fast keystrokes |
+| **Base + random delay** | Fixed minimum interval + jitter simulates human-like typing |
 
 ### Data Flow
 
@@ -107,7 +109,9 @@ TypeEngine::paste_as_keystrokes()
                 │         '\r' → skip
                 │         _   → enigo.text(char)
                 │
-                │       sleep(keystroke_delay_ms)
+                │       delay = keystroke_delay_ms
+                │             + rand(random_delay_min_ms..=random_delay_max_ms)
+                │       sleep(delay)
                 │
                 └─► Done
 ```
@@ -146,6 +150,8 @@ Config is stored at:
 ```json
 {
   "keystroke_delay_ms": 5,
+  "random_delay_min_ms": 0,
+  "random_delay_max_ms": 0,
   "initial_delay_ms": 500,
   "show_notification": true,
   "start_on_login": false,
@@ -156,10 +162,30 @@ Config is stored at:
 }
 ```
 
+### Delay settings explained
+
+Each keystroke waits: **`keystroke_delay_ms` + random(`random_delay_min_ms` .. `random_delay_max_ms`)**
+
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `keystroke_delay_ms` | 5 | Delay between keystrokes (increase for slow connections) |
+| `keystroke_delay_ms` | 5 | Fixed base delay between keystrokes (ms) |
+| `random_delay_min_ms` | 0 | Minimum random jitter added per keystroke (ms) |
+| `random_delay_max_ms` | 0 | Maximum random jitter added per keystroke (ms). Set to 0 to disable jitter |
 | `initial_delay_ms` | 500 | Delay before typing starts (time to focus target window) |
+
+**Examples:**
+
+| Scenario | `keystroke_delay_ms` | `random_delay_min_ms` | `random_delay_max_ms` | Effective delay per key |
+|----------|---------------------|-----------------------|-----------------------|------------------------|
+| Fast (LAN) | 5 | 0 | 0 | 5ms fixed |
+| Slow connection | 50 | 0 | 0 | 50ms fixed |
+| Human-like | 20 | 10 | 80 | 30..100ms random |
+| Very slow (satellite) | 100 | 20 | 150 | 120..250ms random |
+
+### Other settings
+
+| Setting | Default | Description |
+|---------|---------|-------------|
 | `hotkey` | Cmd+Shift+V / Ctrl+Shift+V | Global hotkey trigger |
 | `max_text_length` | 100000 | Safety limit to prevent accidental huge pastes |
 | `newlines_as_enter` | true | Convert `\n` to Enter key presses |
@@ -179,6 +205,7 @@ Config is stored at:
 - [x] Core architecture (macOS + Windows)
 - [x] System tray + global hotkey
 - [x] Persistent configuration
+- [x] Random delay jitter for human-like typing
 - [ ] macOS `.app` bundle with proper Info.plist
 - [ ] Windows installer (MSI/NSIS)
 - [ ] Settings GUI window
