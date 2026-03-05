@@ -1,9 +1,9 @@
 [package]
 name = "typepaste"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["f0lken"]
-description = "Paste clipboard text anywhere via keystroke emulation — even into remote desktops that don't support direct paste"
+description = "Paste clipboard text anywhere via keystroke emulation — even into remote desktops that don't support direct paste. CLI + GUI + future MCP server."
 license = "MIT"
 repository = "https://github.com/f0lken/typepaste"
 keywords = ["clipboard", "paste", "keystroke", "remote-desktop", "automation"]
@@ -24,6 +24,8 @@ serde_json = "1"
 dirs = "6"
 # Random delay jitter
 rand = "0.8"
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
 
 # Cross-platform keyboard simulation
 enigo = "0.3"

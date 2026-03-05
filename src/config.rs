@@ -31,8 +31,16 @@ pub struct Config {
     /// Whether to start the app on system login.
     pub start_on_login: bool,
 
-    /// Hotkey string representation (e.g., "Ctrl+Shift+V" / "Cmd+Shift+V").
+    /// Global hotkey to paste clipboard as keystrokes in tray mode.
+    /// Format: "Modifier+Modifier+Key", e.g. "Cmd+Shift+V", "Ctrl+Shift+V".
+    /// Changes are applied immediately without restart.
     pub hotkey: String,
+
+    /// Optional additional hotkey for paste-as-keystrokes.
+    /// Allows registering a second shortcut alongside the primary one.
+    /// Leave empty to disable. Same format as `hotkey`.
+    #[serde(default)]
+    pub paste_hotkey: String,
 
     /// Maximum text length to process (safety limit).
     pub max_text_length: usize,
@@ -57,6 +65,7 @@ impl Default for Config {
             hotkey: "Cmd+Shift+V".to_string(),
             #[cfg(not(target_os = "macos"))]
             hotkey: "Ctrl+Shift+V".to_string(),
+            paste_hotkey: String::new(),
             max_text_length: 100_000,
             newlines_as_enter: true,
             tabs_as_tab: true,
@@ -102,6 +111,11 @@ impl Config {
     /// Whether random delay jitter is enabled.
     pub fn has_random_delay(&self) -> bool {
         self.random_delay_max_ms > 0
+    }
+
+    /// Whether a secondary paste hotkey is configured.
+    pub fn has_paste_hotkey(&self) -> bool {
+        !self.paste_hotkey.trim().is_empty()
     }
 
     /// Validate configuration values and fix inconsistencies.
