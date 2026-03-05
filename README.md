@@ -1,0 +1,3 @@
+# TypePaste
+
+Temporary initial commit.
