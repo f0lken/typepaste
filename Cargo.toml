@@ -1,6 +1,6 @@
 [package]
 name = "typepaste"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["f0lken"]
 description = "Paste clipboard text anywhere via keystroke emulation — even into remote desktops that don't support direct paste"
@@ -36,6 +36,9 @@ tray-icon = "0.19"
 
 # Event loop (required for tray + hotkeys on all platforms)
 winit = { version = "0.30", features = ["rwh_06"] }
+
+# GUI for settings window
+eframe = "0.29"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = "0.24"

@@ -15,7 +15,7 @@
 //! │  │ Icon     │   │  Listener  │   │  1. Read clipboard     │ │
 //! │  │          │   │            │   │  2. Wait initial delay  │ │
 //! │  │ • Paste  │   │ Cmd+Shift+V│  │  3. Emit keystrokes    │ │
-//! │  │ • Config │   │ (macOS)    │   │     per character      │ │
+//! │  │ • Settings│  │ (macOS)    │   │     per character      │ │
 //! │  │ • Quit   │   │            │   │                        │ │
 //! │  └──────────┘   │ Ctrl+Shift+V│  └────────┬───────────────┘ │
 //! │                 │ (Windows)  │             │                 │
@@ -34,6 +34,7 @@ mod config;
 mod engine;
 mod error;
 mod platform;
+mod ui;
 
 use std::sync::{Arc, Mutex};
 
@@ -61,8 +62,14 @@ fn main() {
         error!("Failed to load config: {e}, using defaults");
         Config::default()
     });
-    info!("Config loaded: delay={}ms, initial={}ms, hotkey={}",
-        config.keystroke_delay_ms, config.initial_delay_ms, config.hotkey);
+    info!(
+        "Config loaded: delay={}ms, random={}..{}ms, initial={}ms, hotkey={}",
+        config.keystroke_delay_ms,
+        config.random_delay_min_ms,
+        config.random_delay_max_ms,
+        config.initial_delay_ms,
+        config.hotkey
+    );
 
     // Create the engine
     let engine = Arc::new(Mutex::new(TypeEngine::new(config.clone())));
@@ -73,14 +80,17 @@ fn main() {
     // ── System Tray ──
     let menu = Menu::new();
     let paste_item = MenuItem::new("Paste as Keystrokes", true, None);
+    let settings_item = MenuItem::new("Settings...", true, None);
     let separator = PredefinedMenuItem::separator();
     let quit_item = MenuItem::new("Quit TypePaste", true, None);
 
     menu.append(&paste_item).unwrap();
+    menu.append(&settings_item).unwrap();
     menu.append(&separator).unwrap();
     menu.append(&quit_item).unwrap();
 
     let paste_item_id = paste_item.id().clone();
+    let settings_item_id = settings_item.id().clone();
     let quit_item_id = quit_item.id().clone();
 
     // Tray icon — use a simple embedded icon or load from file
@@ -108,36 +118,44 @@ fn main() {
     // ── Main Event Loop ──
     let engine_for_tray = engine.clone();
     let engine_for_hotkey = engine.clone();
+    let engine_for_settings = engine.clone();
 
     let menu_channel = MenuEvent::receiver();
     let hotkey_channel = GlobalHotKeyEvent::receiver();
 
-    info!("TypePaste is running. Use {} or tray menu to paste.",
-        config.hotkey);
+    info!(
+        "TypePaste is running. Use {} or tray menu to paste.",
+        config.hotkey
+    );
 
-    event_loop.run(move |_event, event_loop_window_target| {
-        event_loop_window_target.set_control_flow(ControlFlow::Poll);
+    event_loop
+        .run(move |_event, event_loop_window_target| {
+            event_loop_window_target.set_control_flow(ControlFlow::Poll);
 
-        // Handle menu events
-        if let Ok(event) = menu_channel.try_recv() {
-            if event.id() == &paste_item_id {
-                trigger_paste(&engine_for_tray);
-            } else if event.id() == &quit_item_id {
-                info!("Quit requested via tray menu");
-                std::process::exit(0);
+            // Handle menu events
+            if let Ok(event) = menu_channel.try_recv() {
+                if event.id() == &paste_item_id {
+                    trigger_paste(&engine_for_tray);
+                } else if event.id() == &settings_item_id {
+                    info!("Opening settings window");
+                    ui::settings::open_settings_window(engine_for_settings.clone());
+                } else if event.id() == &quit_item_id {
+                    info!("Quit requested via tray menu");
+                    std::process::exit(0);
+                }
             }
-        }
 
-        // Handle hotkey events
-        if let Ok(event) = hotkey_channel.try_recv() {
-            if event.state() == HotKeyState::Pressed {
-                trigger_paste(&engine_for_hotkey);
+            // Handle hotkey events
+            if let Ok(event) = hotkey_channel.try_recv() {
+                if event.state() == HotKeyState::Pressed {
+                    trigger_paste(&engine_for_hotkey);
+                }
             }
-        }
 
-        // Prevent busy-looping: sleep briefly
-        std::thread::sleep(std::time::Duration::from_millis(16));
-    }).expect("Event loop error");
+            // Prevent busy-looping: sleep briefly
+            std::thread::sleep(std::time::Duration::from_millis(16));
+        })
+        .expect("Event loop error");
 }
 
 /// Trigger the paste-as-keystrokes action.
@@ -146,7 +164,6 @@ fn trigger_paste(engine: &Arc<Mutex<TypeEngine>>) {
     let engine = engine.lock().unwrap();
     if let Err(e) = engine.paste_as_keystrokes() {
         error!("Failed to paste: {e}");
-        // TODO: show user notification about the error
     }
 }
 
