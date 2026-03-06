@@ -127,13 +127,8 @@ fn run_cli(command: Command, mut config: Config) {
             if let Some(delay) = args.layout_switch_delay {
                 config.layout_switch.switch_delay_ms = delay;
             }
-            // initial_layout is handled in the engine/platform layer
-            // (not directly in config — it's a runtime override)
-            // For now we log it; actual implementation would pass to type_string
             if let Some(idx) = args.initial_layout {
                 info!("Initial layout index override: {}", idx);
-                // Rearrange layouts so the desired one is at index 0
-                // (since type_string starts from index 0)
                 if idx > 0 && idx < config.layout_switch.layouts.len() {
                     config.layout_switch.layouts.rotate_left(idx);
                     info!(
@@ -164,12 +159,10 @@ fn run_cli(command: Command, mut config: Config) {
             match platform::list_windows() {
                 Ok(windows) => {
                     if args.json {
-                        // JSON output for programmatic consumption (MCP server)
                         let json = serde_json::to_string_pretty(&windows)
                             .expect("Failed to serialize windows");
                         println!("{json}");
                     } else {
-                        // Human-readable table
                         if windows.is_empty() {
                             println!("No visible windows found.");
                             return;
@@ -249,8 +242,8 @@ fn run_tray(config: Config) {
     let settings_item_id = settings_item.id().clone();
     let quit_item_id = quit_item.id().clone();
 
-    // Tray icon
-    let icon = load_tray_icon();
+    // Tray icon — generated programmatically (no external file needed)
+    let icon = generate_tray_icon();
 
     let _tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
@@ -338,7 +331,6 @@ fn run_tray(config: Config) {
             }
 
             // ── Hot-reload hotkeys on config change ──
-            // Check if the engine's config has changed hotkeys (from settings GUI)
             if let Ok(engine) = engine_for_hk_check.lock() {
                 let cfg = engine.config();
                 reregister_hotkeys_if_changed(&hotkey_manager, &mut hk_state, cfg);
@@ -362,11 +354,9 @@ fn reregister_hotkeys_if_changed(
             "Hotkey changed: '{}' → '{}', re-registering",
             state.current_hotkey_str, config.hotkey
         );
-        // Unregister old
         if let Some(old) = state.current_hotkey {
             let _ = manager.unregister(old);
         }
-        // Register new
         let new_hk = parse_hotkey(&config.hotkey);
         if let Some(hk) = &new_hk {
             if let Err(e) = manager.register(*hk) {
@@ -386,11 +376,9 @@ fn reregister_hotkeys_if_changed(
             if state.current_paste_hotkey_str.is_empty() { "(none)" } else { &state.current_paste_hotkey_str },
             if config.paste_hotkey.is_empty() { "(none)" } else { &config.paste_hotkey }
         );
-        // Unregister old
         if let Some(old) = state.current_paste_hotkey {
             let _ = manager.unregister(old);
         }
-        // Register new
         let new_hk = if config.has_paste_hotkey() {
             let hk = parse_hotkey(&config.paste_hotkey);
             if let Some(ref hk) = hk {
@@ -480,7 +468,6 @@ fn parse_hotkey(s: &str) -> Option<HotKey> {
                         _ => None,
                     };
                 } else {
-                    // Named keys: F1-F12, Space, Enter, etc.
                     code = match key {
                         "f1" => Some(Code::F1),
                         "f2" => Some(Code::F2),
@@ -526,15 +513,56 @@ fn parse_hotkey(s: &str) -> Option<HotKey> {
     }
 }
 
-/// Load tray icon from embedded bytes (PNG).
-fn load_tray_icon() -> tray_icon::Icon {
-    // 16x16 PNG icon embedded at compile time
-    // For production, use a proper icon file
-    let icon_bytes = include_bytes!("../assets/icon.png");
-    let image = image::load_from_memory(icon_bytes)
-        .expect("Failed to load tray icon")
-        .into_rgba8();
-    let (width, height) = image.dimensions();
-    let rgba = image.into_raw();
-    tray_icon::Icon::from_rgba(rgba, width, height).expect("Failed to create tray icon")
+/// Generate a 32×32 RGBA tray icon programmatically.
+///
+/// Draws a simple "TP" icon with a blue-ish background — no external
+/// asset file required. This avoids the `include_bytes!("../assets/icon.png")`
+/// dependency that caused compile errors when assets/ didn't exist.
+fn generate_tray_icon() -> tray_icon::Icon {
+    const SIZE: u32 = 32;
+    let mut rgba = vec![0u8; (SIZE * SIZE * 4) as usize];
+
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let idx = ((y * SIZE + x) * 4) as usize;
+            // Background: rounded-ish blue square
+            let margin = 2u32;
+            let in_box = x >= margin && x < SIZE - margin && y >= margin && y < SIZE - margin;
+
+            if in_box {
+                // Blue background (#3B82F6)
+                rgba[idx] = 0x3B;     // R
+                rgba[idx + 1] = 0x82; // G
+                rgba[idx + 2] = 0xF6; // B
+                rgba[idx + 3] = 255;  // A
+            } else {
+                // Transparent
+                rgba[idx + 3] = 0;
+            }
+        }
+    }
+
+    // Draw a simple "T" shape in white
+    // Horizontal bar: y=8..11, x=6..25
+    for y in 8..12 {
+        for x in 6..26 {
+            let idx = ((y * SIZE + x) * 4) as usize;
+            rgba[idx] = 255;
+            rgba[idx + 1] = 255;
+            rgba[idx + 2] = 255;
+            rgba[idx + 3] = 255;
+        }
+    }
+    // Vertical bar: y=12..26, x=13..18
+    for y in 12..26 {
+        for x in 13..19 {
+            let idx = ((y * SIZE + x) * 4) as usize;
+            rgba[idx] = 255;
+            rgba[idx + 1] = 255;
+            rgba[idx + 2] = 255;
+            rgba[idx + 3] = 255;
+        }
+    }
+
+    tray_icon::Icon::from_rgba(rgba, SIZE, SIZE).expect("Failed to create tray icon")
 }

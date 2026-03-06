@@ -1,14 +1,20 @@
-//! Windows implementation using SendInput / enigo for keystroke emulation.
+//! Windows implementation using enigo 0.2+ for keystroke emulation.
 //!
-//! Uses the Windows SendInput API (via the `enigo` crate) to synthesize
+//! Uses the `enigo` crate (which wraps Windows SendInput API) to synthesize
 //! keyboard events at the OS level. This approach works even in applications
 //! that block clipboard paste, remote desktop sessions, VMs, and terminal
 //! emulators.
+//!
+//! For layout switch hotkeys, we use the raw Windows SendInput API directly
+//! to avoid any issues with enigo's key mapping.
 
 use std::thread;
 use std::time::Duration;
 
-use enigo::{Enigo, Key, KeyboardControllable};
+use enigo::{
+    Direction::{Click, Press, Release},
+    Enigo, Key, Keyboard, Settings,
+};
 use log::{debug, info, warn};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VK_SHIFT, VK_CONTROL,
@@ -17,211 +23,324 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 
 use crate::config::Config;
 use crate::error::{Result, TypePasteError};
+use super::WindowInfo;
 
-/// Implements keystroke emulation on Windows using SendInput.
-pub struct WindowsPlatform {
-    config: Config,
+// ─── Public free functions (called by engine.rs via platform::*) ────────────────
+
+/// On Windows, accessibility is generally available — just return Ok.
+pub fn check_accessibility() -> Result<()> {
+    debug!("Windows: no accessibility check required");
+    Ok(())
 }
 
-impl WindowsPlatform {
-    pub fn new(config: Config) -> Self {
-        Self { config }
+/// Type a string by emitting individual keystroke events.
+///
+/// When `config.layout_switch.enabled` is true, detects Unicode script
+/// boundary crossings and emits the layout switch hotkey as needed.
+pub fn type_string(text: &str, config: &Config) -> Result<()> {
+    if text.is_empty() {
+        return Ok(());
     }
 
-    /// Type a string by emitting individual keystrokes.
-    pub fn type_string(&self, text: &str) -> Result<()> {
-        if text.is_empty() {
-            return Ok(());
-        }
+    info!("Typing {} characters on Windows", text.len());
 
-        info!("Typing {} characters on Windows", text.len());
+    let mut enigo = Enigo::new(&Settings::default())
+        .map_err(|e| TypePasteError::Platform(format!("Failed to create Enigo: {e}")))?;
 
-        // Handle layout switching if enabled
-        if self.config.layout_switch.enabled && self.config.layout_switch.layouts.len() > 1 {
-            return self.type_string_with_layout_switch(text);
-        }
+    let ls = &config.layout_switch;
+    let layout_enabled = ls.enabled && ls.layouts.len() > 1 && !ls.switch_hotkey.is_empty();
 
-        self.type_string_direct(text)
-    }
+    let mut current_layout: usize = 0;
 
-    /// Type text without layout switching (standard path).
-    fn type_string_direct(&self, text: &str) -> Result<()> {
-        let mut enigo = Enigo::new();
-
-        // Apply initial delay
-        if self.config.initial_delay_ms > 0 {
-            thread::sleep(Duration::from_millis(self.config.initial_delay_ms));
-        }
-
-        for ch in text.chars() {
-            self.type_char_enigo(&mut enigo, ch)?;
-            self.apply_delay();
-        }
-
-        Ok(())
-    }
-
-    /// Type text with automatic keyboard layout switching.
-    ///
-    /// Detects when the script changes (e.g. Latin → Cyrillic) and emits
-    /// the configured layout switch hotkey before typing the next character.
-    fn type_string_with_layout_switch(&self, text: &str) -> Result<()> {
-        let ls = &self.config.layout_switch;
-        let mut enigo = Enigo::new();
-
-        // Apply initial delay
-        if self.config.initial_delay_ms > 0 {
-            thread::sleep(Duration::from_millis(self.config.initial_delay_ms));
-        }
-
-        let mut current_layout: usize = 0; // assume first layout is active
-
-        for ch in text.chars() {
-            // Determine the required layout for this character
-            if let Some(target_layout) = ls.layout_for_char(ch) {
-                if target_layout != current_layout {
-                    let presses = ls.presses_needed(current_layout, target_layout);
-                    info!(
-                        "Layout switch: {} → {} ({} press(es)) before '{}'",
+    for ch in text.chars() {
+        // ── Layout switching ──
+        if layout_enabled {
+            if let Some(needed_layout) = ls.layout_for_char(ch) {
+                if needed_layout != current_layout {
+                    let presses = ls.presses_needed(current_layout, needed_layout);
+                    debug!(
+                        "Layout switch: {} → {} ({} press(es) of '{}')",
                         ls.layouts[current_layout].name,
-                        ls.layouts[target_layout].name,
+                        ls.layouts[needed_layout].name,
                         presses,
-                        ch
+                        ls.switch_hotkey
                     );
                     for _ in 0..presses {
-                        self.press_layout_switch_hotkey()?;
+                        press_layout_switch_hotkey(&ls.switch_hotkey)?;
                         thread::sleep(Duration::from_millis(ls.switch_delay_ms));
                     }
-                    current_layout = target_layout;
+                    current_layout = needed_layout;
                 }
             }
-            // Neutral characters (digits, punctuation) — no layout switch needed
-
-            self.type_char_enigo(&mut enigo, ch)?;
-            self.apply_delay();
         }
 
-        Ok(())
-    }
-
-    /// Press the layout switch hotkey using Windows SendInput.
-    fn press_layout_switch_hotkey(&self) -> Result<()> {
-        let hotkey = &self.config.layout_switch.switch_hotkey;
-        debug!("Pressing layout switch hotkey: {}", hotkey);
-
-        let keys = parse_hotkey_to_vk(hotkey);
-        if keys.is_empty() {
-            return Err(TypePasteError::Platform(
-                format!("Cannot parse layout switch hotkey: {hotkey}")
-            ));
-        }
-
-        // Press all keys down, then release all
-        for &vk in &keys {
-            send_vk_event(vk, false)?;
-        }
-        for &vk in keys.iter().rev() {
-            send_vk_event(vk, true)?;
-        }
-
-        Ok(())
-    }
-
-    /// Type a single character using enigo.
-    fn type_char_enigo(&self, enigo: &mut Enigo, ch: char) -> Result<()> {
+        // ── Type the character ──
         match ch {
-            '\n' if self.config.newlines_as_enter => {
-                enigo.key_click(Key::Return);
+            '\n' if config.newlines_as_enter => {
+                enigo.key(Key::Return, Click)
+                    .map_err(|e| TypePasteError::Platform(format!("Key Return: {e}")))?;
             }
-            '\t' if self.config.tabs_as_tab => {
-                enigo.key_click(Key::Tab);
+            '\t' if config.tabs_as_tab => {
+                enigo.key(Key::Tab, Click)
+                    .map_err(|e| TypePasteError::Platform(format!("Key Tab: {e}")))?;
+            }
+            '\r' => {
+                // Skip carriage returns
+                continue;
             }
             _ => {
-                enigo.key_sequence(&ch.to_string());
+                enigo.text(&ch.to_string())
+                    .map_err(|e| TypePasteError::Platform(format!("Text '{}': {e}", ch)))?;
             }
         }
-        Ok(())
-    }
 
-    /// Apply per-keystroke delay (base + optional random jitter).
-    fn apply_delay(&self) {
-        let base = self.config.keystroke_delay_ms;
-        let delay = if self.config.has_random_delay() {
-            use rand::Rng;
-            let jitter = rand::thread_rng().gen_range(
-                self.config.random_delay_min_ms..=self.config.random_delay_max_ms
-            );
-            base + jitter
-        } else {
-            base
-        };
-        if delay > 0 {
-            thread::sleep(Duration::from_millis(delay));
+        // ── Per-keystroke delay ──
+        let delay = compute_delay(config);
+        if !delay.is_zero() {
+            thread::sleep(delay);
         }
     }
 
-    /// List all visible windows using EnumWindows.
-    pub fn list_windows(&self) -> Result<Vec<crate::platform::WindowInfo>> {
-        use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
+    Ok(())
+}
+
+/// Focus a window whose title contains the given substring.
+pub fn focus_window_by_title(title: &str) -> Result<(u32, String)> {
+    use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowTextW, GetWindowTextLengthW,
+        GetWindowThreadProcessId, IsWindowVisible, SetForegroundWindow,
+    };
+
+    struct SearchResult {
+        target: String,
+        found_hwnd: Option<isize>,
+        found_pid: u32,
+        found_title: String,
+    }
+
+    let mut search = SearchResult {
+        target: title.to_lowercase(),
+        found_hwnd: None,
+        found_pid: 0,
+        found_title: String::new(),
+    };
+
+    unsafe extern "system" fn callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let search = &mut *(lparam.0 as *mut SearchResult);
+
         use windows::Win32::UI::WindowsAndMessaging::{
-            EnumWindows, GetWindowTextW, GetWindowThreadProcessId,
-            IsWindowVisible, GetWindowTextLengthW,
+            GetWindowTextW, GetWindowTextLengthW,
+            GetWindowThreadProcessId, IsWindowVisible,
         };
 
-        let mut windows: Vec<crate::platform::WindowInfo> = Vec::new();
-        let windows_ptr = &mut windows as *mut _ as isize;
+        if !IsWindowVisible(hwnd).as_bool() {
+            return BOOL(1);
+        }
 
+        let len = GetWindowTextLengthW(hwnd);
+        if len <= 0 {
+            return BOOL(1);
+        }
+
+        let mut buf = vec![0u16; (len + 1) as usize];
+        GetWindowTextW(hwnd, &mut buf);
+        let win_title = String::from_utf16_lossy(&buf[..len as usize]);
+
+        if win_title.to_lowercase().contains(&search.target) {
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(hwnd, Some(&mut pid));
+            search.found_hwnd = Some(hwnd.0 as isize);
+            search.found_pid = pid;
+            search.found_title = win_title;
+            return BOOL(0); // stop enumeration
+        }
+
+        BOOL(1)
+    }
+
+    unsafe {
+        let _ = EnumWindows(
+            Some(callback),
+            LPARAM(&mut search as *mut _ as isize),
+        );
+    }
+
+    if let Some(hwnd_val) = search.found_hwnd {
         unsafe {
-            EnumWindows(
-                Some(enum_windows_callback),
-                LPARAM(windows_ptr),
-            )
-            .map_err(|e| TypePasteError::Platform(format!("EnumWindows failed: {e}")))?
-        };
-
-        Ok(windows)
-    }
-
-    /// Focus a window by its HWND and then type text.
-    pub fn type_to_window(&self, text: &str, pid: u32, title: Option<&str>) -> Result<()> {
-        use windows::Win32::Foundation::HWND;
-        use windows::Win32::UI::WindowsAndMessaging::{
-            FindWindowW, SetForegroundWindow,
-        };
-
-        // Try to find window by title first
-        if let Some(title_str) = title {
-            let wide: Vec<u16> = title_str.encode_utf16().chain(std::iter::once(0)).collect();
-            let hwnd = unsafe { FindWindowW(None, windows::core::PCWSTR(wide.as_ptr())) };
-            if hwnd != HWND(0) {
-                unsafe { SetForegroundWindow(hwnd) };
-                thread::sleep(Duration::from_millis(200));
-                debug!("Focused window '{}' by title", title_str);
-                return self.type_string(text);
-            }
+            use windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow;
+            SetForegroundWindow(HWND(hwnd_val as *mut _));
         }
-
-        // Fall back to focusing by PID
-        if let Ok(windows) = self.list_windows() {
-            if let Some(win) = windows.iter().find(|w| w.pid == pid) {
-                let wide: Vec<u16> = win.title.encode_utf16().chain(std::iter::once(0)).collect();
-                let hwnd = unsafe {
-                    windows::Win32::UI::WindowsAndMessaging::FindWindowW(
-                        None, windows::core::PCWSTR(wide.as_ptr())
-                    )
-                };
-                if hwnd != HWND(0) {
-                    unsafe { windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd) };
-                    thread::sleep(Duration::from_millis(200));
-                }
-            }
-        }
-
-        self.type_string(text)
+        thread::sleep(Duration::from_millis(200));
+        info!("Focused window: \"{}\" (PID {})", search.found_title, search.found_pid);
+        Ok((search.found_pid, search.found_title))
+    } else {
+        Err(TypePasteError::Platform(format!(
+            "No window found matching title: \"{title}\""
+        )))
     }
 }
 
-// ─── SendInput helpers ─────────────────────────────────────────────────────────
+/// Focus a window owned by the given PID.
+pub fn focus_window_by_pid(pid: u32) -> Result<String> {
+    use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowTextW, GetWindowTextLengthW,
+        GetWindowThreadProcessId, IsWindowVisible, SetForegroundWindow,
+    };
+
+    struct SearchResult {
+        target_pid: u32,
+        found_hwnd: Option<isize>,
+        found_title: String,
+    }
+
+    let mut search = SearchResult {
+        target_pid: pid,
+        found_hwnd: None,
+        found_title: String::new(),
+    };
+
+    unsafe extern "system" fn callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let search = &mut *(lparam.0 as *mut SearchResult);
+
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetWindowTextW, GetWindowTextLengthW,
+            GetWindowThreadProcessId, IsWindowVisible,
+        };
+
+        if !IsWindowVisible(hwnd).as_bool() {
+            return BOOL(1);
+        }
+
+        let mut win_pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut win_pid));
+
+        if win_pid == search.target_pid {
+            let len = GetWindowTextLengthW(hwnd);
+            if len > 0 {
+                let mut buf = vec![0u16; (len + 1) as usize];
+                GetWindowTextW(hwnd, &mut buf);
+                search.found_title = String::from_utf16_lossy(&buf[..len as usize]);
+                search.found_hwnd = Some(hwnd.0 as isize);
+                return BOOL(0); // stop
+            }
+        }
+
+        BOOL(1)
+    }
+
+    unsafe {
+        let _ = EnumWindows(
+            Some(callback),
+            LPARAM(&mut search as *mut _ as isize),
+        );
+    }
+
+    if let Some(hwnd_val) = search.found_hwnd {
+        unsafe {
+            SetForegroundWindow(HWND(hwnd_val as *mut _));
+        }
+        thread::sleep(Duration::from_millis(200));
+        info!("Focused PID {} window: \"{}\"", pid, search.found_title);
+        Ok(search.found_title)
+    } else {
+        Err(TypePasteError::Platform(format!(
+            "No window found with PID {pid}"
+        )))
+    }
+}
+
+/// List visible windows with their title, PID, and app name.
+pub fn list_windows() -> Result<Vec<WindowInfo>> {
+    use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowTextW, GetWindowTextLengthW,
+        GetWindowThreadProcessId, IsWindowVisible,
+    };
+
+    let mut windows: Vec<WindowInfo> = Vec::new();
+
+    unsafe extern "system" fn callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetWindowTextW, GetWindowTextLengthW,
+            GetWindowThreadProcessId, IsWindowVisible,
+        };
+
+        if !IsWindowVisible(hwnd).as_bool() {
+            return BOOL(1);
+        }
+
+        let len = GetWindowTextLengthW(hwnd);
+        if len <= 0 {
+            return BOOL(1);
+        }
+
+        let mut buf = vec![0u16; (len + 1) as usize];
+        GetWindowTextW(hwnd, &mut buf);
+        let title = String::from_utf16_lossy(&buf[..len as usize]);
+
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+
+        let app_name = get_process_name(pid);
+
+        let windows = &mut *(lparam.0 as *mut Vec<WindowInfo>);
+        windows.push(WindowInfo {
+            title,
+            pid,
+            app_name,
+        });
+
+        BOOL(1) // continue
+    }
+
+    unsafe {
+        EnumWindows(
+            Some(callback),
+            LPARAM(&mut windows as *mut _ as isize),
+        )
+        .map_err(|e| TypePasteError::Platform(format!("EnumWindows failed: {e}")))?;
+    }
+
+    Ok(windows)
+}
+
+// ─── Internal helpers ───────────────────────────────────────────────────────────
+
+/// Compute the delay for a single keystroke: base + optional random jitter.
+fn compute_delay(config: &Config) -> Duration {
+    let base = config.keystroke_delay_ms;
+    let jitter = if config.has_random_delay() {
+        use rand::Rng;
+        rand::thread_rng().gen_range(config.random_delay_min_ms..=config.random_delay_max_ms)
+    } else {
+        0
+    };
+    Duration::from_millis(base + jitter)
+}
+
+/// Press the layout switch hotkey using Windows SendInput.
+fn press_layout_switch_hotkey(hotkey: &str) -> Result<()> {
+    debug!("Pressing layout switch hotkey: {}", hotkey);
+
+    let keys = parse_hotkey_to_vk(hotkey);
+    if keys.is_empty() {
+        return Err(TypePasteError::Platform(
+            format!("Cannot parse layout switch hotkey: {hotkey}")
+        ));
+    }
+
+    // Press all keys down, then release all in reverse order
+    for &vk in &keys {
+        send_vk_event(vk, false)?;
+    }
+    for &vk in keys.iter().rev() {
+        send_vk_event(vk, true)?;
+    }
+
+    Ok(())
+}
 
 /// Send a single virtual key event (key down or key up).
 fn send_vk_event(vk: u16, key_up: bool) -> Result<()> {
@@ -252,7 +371,6 @@ fn send_vk_event(vk: u16, key_up: bool) -> Result<()> {
 }
 
 /// Parse a hotkey string into a list of virtual key codes.
-/// Example: "Alt+Shift" → [VK_MENU, VK_SHIFT]
 fn parse_hotkey_to_vk(s: &str) -> Vec<u16> {
     let mut keys = Vec::new();
     for part in s.split('+').map(|p| p.trim()) {
@@ -274,40 +392,6 @@ fn parse_hotkey_to_vk(s: &str) -> Vec<u16> {
     keys
 }
 
-// ─── EnumWindows callback ──────────────────────────────────────────────────────
-
-unsafe extern "system" fn enum_windows_callback(
-    hwnd: windows::Win32::Foundation::HWND,
-    lparam: windows::Win32::Foundation::LPARAM,
-) -> windows::Win32::Foundation::BOOL {
-    use windows::Win32::UI::WindowsAndMessaging::{
-        GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, GetWindowTextLengthW,
-    };
-
-    if IsWindowVisible(hwnd).as_bool() {
-        let len = GetWindowTextLengthW(hwnd);
-        if len > 0 {
-            let mut buf = vec![0u16; (len + 1) as usize];
-            GetWindowTextW(hwnd, &mut buf);
-            let title = String::from_utf16_lossy(&buf[..len as usize]);
-
-            let mut pid = 0u32;
-            GetWindowThreadProcessId(hwnd, Some(&mut pid));
-
-            // Get app name via process
-            let app_name = get_process_name(pid);
-
-            let windows = &mut *(lparam.0 as *mut Vec<crate::platform::WindowInfo>);
-            windows.push(crate::platform::WindowInfo {
-                pid,
-                app_name,
-                title,
-            });
-        }
-    }
-    windows::Win32::Foundation::BOOL(1) // continue enumeration
-}
-
 /// Get the process name (executable name without extension) for a given PID.
 fn get_process_name(pid: u32) -> String {
     use windows::Win32::System::Threading::{
@@ -321,10 +405,9 @@ fn get_process_name(pid: u32) -> String {
         if let Ok(handle) = handle {
             let mut buf = vec![0u16; 260];
             let len = GetModuleBaseNameW(handle, None, &mut buf);
-            CloseHandle(handle).ok();
+            let _ = CloseHandle(handle);
             if len > 0 {
                 let name = String::from_utf16_lossy(&buf[..len as usize]);
-                // Strip .exe extension
                 return name.trim_end_matches(".exe").to_string();
             }
         }

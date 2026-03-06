@@ -2,8 +2,12 @@
 //!
 //! Provides a cross-platform GUI for editing TypePaste configuration.
 //! Changes are applied immediately and persisted to disk.
+//!
+//! **Important**: `open_settings_window` spawns a new thread so that
+//! `eframe::run_native` doesn't block the tray event loop.
 
 use std::sync::{Arc, Mutex};
+use std::thread;
 
 use eframe::egui::{self, RichText};
 use log::{error, info};
@@ -11,29 +15,34 @@ use log::{error, info};
 use crate::config::{Config, LayoutDefinition};
 use crate::engine::TypeEngine;
 
-/// Open the settings window. Blocks until the window is closed.
+/// Open the settings window in a background thread.
+///
+/// `eframe::run_native` blocks until the window is closed, so we run it
+/// on a dedicated thread to keep the tray / event-loop responsive.
 pub fn open_settings_window(engine: Arc<Mutex<TypeEngine>>) {
-    let config = {
-        let engine = engine.lock().unwrap();
-        engine.config().clone()
-    };
+    thread::spawn(move || {
+        let config = {
+            let engine = engine.lock().unwrap();
+            engine.config().clone()
+        };
 
-    let app = SettingsApp::new(config, engine);
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("TypePaste Settings")
-            .with_inner_size([520.0, 700.0])
-            .with_resizable(true),
-        ..Default::default()
-    };
+        let app = SettingsApp::new(config, engine);
+        let options = eframe::NativeOptions {
+            viewport: egui::ViewportBuilder::default()
+                .with_title("TypePaste Settings")
+                .with_inner_size([520.0, 700.0])
+                .with_resizable(true),
+            ..Default::default()
+        };
 
-    if let Err(e) = eframe::run_native(
-        "TypePaste Settings",
-        options,
-        Box::new(|_cc| Ok(Box::new(app))),
-    ) {
-        error!("Settings window error: {e}");
-    }
+        if let Err(e) = eframe::run_native(
+            "TypePaste Settings",
+            options,
+            Box::new(|_cc| Ok(Box::new(app))),
+        ) {
+            error!("Settings window error: {e}");
+        }
+    });
 }
 
 // ─── App state ─────────────────────────────────────────────────────────────────
@@ -290,7 +299,7 @@ impl eframe::App for SettingsApp {
 
 /// Parse a comma-separated list of hex range strings like "0041-005A,0061-007A"
 /// into a Vec<[u32; 2]>.
-fn parse_unicode_ranges(input: &str) -> Result<Vec<[u32; 2]>, String> {
+fn parse_unicode_ranges(input: &str) -> std::result::Result<Vec<[u32; 2]>, String> {
     let mut ranges = Vec::new();
     for part in input.split(',') {
         let part = part.trim();

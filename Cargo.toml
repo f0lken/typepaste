@@ -1,6 +1,6 @@
 [package]
 name = "typepaste"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 authors = ["hakimaru@gmail.com"]
 description = "Paste text anywhere via keystroke emulation — works in VMs, RDP, and restricted apps"
@@ -31,7 +31,6 @@ tray-icon = "0.17"
 global-hotkey = "0.6"
 eframe = "0.29"
 egui = "0.29"
-image = "0.25"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 enigo = "0.2"
@@ -40,8 +39,8 @@ tray-icon = "0.17"
 global-hotkey = "0.6"
 eframe = "0.29"
 egui = "0.29"
-image = "0.25"
-[dependencies.windows]
+
+[target.'cfg(target_os = "windows")'.dependencies.windows]
 version = "0.58"
 features = [
     "Win32_Foundation",
